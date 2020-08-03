@@ -12,6 +12,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <string.h>
 
 #include <jack/jack.h>
 #include <samplerate.h>
@@ -28,6 +29,7 @@ static float* buffer_right;
 static jack_status_t st;
 static int error;
 
+static int generated = 1, millis;
 static unsigned char asap_buf[4096]; /* XXX: what is an appropriate size? */
 static float asap_buf2[4096];
 
@@ -35,7 +37,8 @@ static void* moddata;
 static int modfd, moddata_length;
 
 static long gen_samples(void* payload, float** data) {
-	ASAP_Generate(asap_ctx, asap_buf, sizeof(asap_buf), ASAPSampleFormat_U8); /* XXX: check return value? */
+	generated = ASAP_Generate(asap_ctx, asap_buf, sizeof(asap_buf), ASAPSampleFormat_U8);
+	memset(&(asap_buf[generated]), 128, sizeof(asap_buf) - generated);
 
 	for(size_t i = 0; i < sizeof(asap_buf); ++i) {
 		asap_buf2[i] = (float)(asap_buf[i] - 128) / 128.f;
@@ -81,6 +84,7 @@ int main(int argc, char** argv) {
 	error = ASAP_Load(asap_ctx, argv[1], moddata, moddata_length);
 	assert(error == 1); /* XXX: ambiguous documentation */
 	ASAP_PlaySong(asap_ctx, 0, -1);
+	ASAP_DetectSilence(asap_ctx, 2);
 
 	src_ctx = src_callback_new(gen_samples, 2, 2, &error, 0);
 	assert(error == 0);
@@ -92,9 +96,13 @@ int main(int argc, char** argv) {
 	error = jack_connect(jack_ctx, "asapjack:right", "system:playback_2");
 	assert(error == 0);
 
-	while(1) {
-		sleep(1); /* XXX: check end of song playback */
+	while(generated > 0) {
+		millis = ASAP_GetPosition(asap_ctx);
+		printf("\r%02d:%02d.%03d", millis / 60000, (millis / 1000) % 60, millis % 1000);
+		fflush(stdout);
+		usleep(50000);
 	}
+	putchar('\n');
 
 	jack_deactivate(jack_ctx);
 
