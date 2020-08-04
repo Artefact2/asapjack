@@ -20,6 +20,7 @@
 
 static SRC_STATE* src_ctx;
 static ASAP* asap_ctx;
+static ASAPInfo const* asap_info;
 static jack_client_t* jack_ctx;
 static jack_port_t* jack_left;
 static jack_port_t* jack_right;
@@ -30,13 +31,17 @@ static jack_status_t st;
 static int error;
 
 static int generated = 1, millis;
-static unsigned char asap_buf[4096]; /* XXX: what is an appropriate size? */
+/* XXX: what is an appropriate size?
+ * https://github.com/erikd/libsamplerate/blob/master/examples/varispeed-play.c
+ * also uses 4096 so it can't be that terrible of a choice. too small
+ * and the resampling will be bad, too big and it will cause xruns */
+static unsigned char asap_buf[4096];
 static float asap_buf2[4096];
 
 static void* moddata;
 static int modfd, moddata_length;
 
-static long gen_samples(void* payload, float** data) {
+static long gen_samples_stereo(void* payload, float** data) {
 	generated = ASAP_Generate(asap_ctx, asap_buf, sizeof(asap_buf), ASAPSampleFormat_U8);
 	memset(&(asap_buf[generated]), 128, sizeof(asap_buf) - generated);
 
@@ -46,6 +51,20 @@ static long gen_samples(void* payload, float** data) {
 
 	*data = asap_buf2;
 	return sizeof(asap_buf) / 2; /* number of generated frames */
+}
+
+static long gen_samples_mono(void* payload, float** data) {
+	/* upmix to stereo */
+	/* ASAP_Generate takes a given number of SAMPLES, not FRAMES */
+	generated = ASAP_Generate(asap_ctx, asap_buf, sizeof(asap_buf) / 2, ASAPSampleFormat_U8);
+	memset(&(asap_buf[generated]), 128, sizeof(asap_buf) / 2 - generated);
+
+	for(size_t i = 0; i < sizeof(asap_buf) / 2; ++i) {
+		asap_buf2[2*i+1] = asap_buf2[2*i] = (float)(asap_buf[i] - 128) / 128.f;
+	}
+
+	*data = asap_buf2;
+	return sizeof(asap_buf) / 2;
 }
 
 static int jack_process(jack_nframes_t nframes, void* payload) {
@@ -85,8 +104,8 @@ int main(int argc, char** argv) {
 	assert(error == 1); /* XXX: ambiguous documentation */
 	ASAP_PlaySong(asap_ctx, 0, -1);
 	ASAP_DetectSilence(asap_ctx, 2);
-
-	src_ctx = src_callback_new(gen_samples, 2, 2, &error, 0);
+	asap_info = ASAP_GetInfo(asap_ctx);
+	src_ctx = src_callback_new(ASAPInfo_GetChannels(asap_info) == 1 ? gen_samples_mono : gen_samples_stereo, 2, 2, &error, 0);
 	assert(error == 0);
 
 	error = jack_set_process_callback(jack_ctx, jack_process, 0);
