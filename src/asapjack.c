@@ -6,132 +6,203 @@
  * License, Version 2, as published by Sam Hocevar. See
  * http://sam.zoy.org/wtfpl/COPYING for more details. */
 
+#include <fcntl.h>
 #include <stdio.h>
-#include <assert.h>
-#include <unistd.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <fcntl.h>
-#include <string.h>
+#include <unistd.h>
 
+#include <asap.h>
 #include <jack/jack.h>
 #include <samplerate.h>
-#include <asap.h>
 
-static SRC_STATE* src_ctx;
-static ASAP* asap_ctx;
-static ASAPInfo const* asap_info;
-static jack_client_t* jack_ctx;
-static jack_port_t* jack_left;
-static jack_port_t* jack_right;
-static float* buffer_left;
-static float* buffer_right;
+#define BUFSZ 128
 
-static jack_status_t st;
-static int error;
+struct playback_context {
+	jack_client_t* jack_ctx;
+	jack_port_t* left;
+	jack_port_t* right;
+	SRC_STATE* src_ctx;
+	ASAP* asap_ctx;
+	ASAPInfo const* info;
 
-static int generated = 1, millis;
-/* XXX: what is an appropriate size?
- * https://github.com/erikd/libsamplerate/blob/master/examples/varispeed-play.c
- * also uses 4096 so it can't be that terrible of a choice. too small
- * and the resampling will be bad, too big and it will cause xruns */
-static unsigned char asap_buf[4096];
-static float asap_buf2[4096];
+	int ready;
+	int generated;
 
-static void* moddata;
-static int modfd, moddata_length;
+	unsigned char asap_out[BUFSZ];
+	float src_in[BUFSZ];
+};
+
+
 
 static long gen_samples_stereo(void* payload, float** data) {
-	generated = ASAP_Generate(asap_ctx, asap_buf, sizeof(asap_buf), ASAPSampleFormat_U8);
-	memset(&(asap_buf[generated]), 128, sizeof(asap_buf) - generated);
+	struct playback_context* p = payload;
 
-	for(size_t i = 0; i < sizeof(asap_buf); ++i) {
-		asap_buf2[i] = (float)(asap_buf[i] - 128) / 128.f;
+	p->generated = ASAP_Generate(p->asap_ctx, p->asap_out, BUFSZ, ASAPSampleFormat_U8);
+	memset(&(p->asap_out[p->generated]), 128, BUFSZ - p->generated);
+
+	for(size_t i = 0; i < BUFSZ; ++i) {
+		p->src_in[i] = (float)(p->asap_out[i] - 128) / 128.f;
 	}
 
-	*data = asap_buf2;
-	return sizeof(asap_buf) / 2; /* number of generated frames */
+	*data = p->src_in;
+	return BUFSZ / 2; /* number of generated frames */
 }
 
 static long gen_samples_mono(void* payload, float** data) {
 	/* upmix to stereo */
 	/* ASAP_Generate takes a given number of SAMPLES, not FRAMES */
-	generated = ASAP_Generate(asap_ctx, asap_buf, sizeof(asap_buf) / 2, ASAPSampleFormat_U8);
-	memset(&(asap_buf[generated]), 128, sizeof(asap_buf) / 2 - generated);
+	struct playback_context* p = payload;
 
-	for(size_t i = 0; i < sizeof(asap_buf) / 2; ++i) {
-		asap_buf2[2*i+1] = asap_buf2[2*i] = (float)(asap_buf[i] - 128) / 128.f;
+	p->generated = ASAP_Generate(p->asap_ctx, p->asap_out, BUFSZ / 2, ASAPSampleFormat_U8);
+	memset(&(p->asap_out[p->generated]), 128, BUFSZ / 2 - p->generated);
+
+	for(size_t i = 0; i < BUFSZ / 2; ++i) {
+		p->src_in[2*i+1] = p->src_in[2*i] = (float)(p->asap_out[i] - 128) / 128.f;
 	}
 
-	*data = asap_buf2;
-	return sizeof(asap_buf) / 2;
+	*data = p->src_in;
+	return BUFSZ / 2;
 }
 
 static int jack_process(jack_nframes_t nframes, void* payload) {
+	struct playback_context* p = payload; /* XXX there's got to be a better way */
 	float buf[2*nframes]; /* XXX need to deinterleave the frames, this sucks */
+	float* buffer_left = jack_port_get_buffer(p->left, nframes);
+	float* buffer_right = jack_port_get_buffer(p->right, nframes);
 
-	buffer_left = jack_port_get_buffer(jack_left, nframes);
-	buffer_right = jack_port_get_buffer(jack_right, nframes);
+	if(p->ready) {
+		if(src_callback_read(p->src_ctx, (double)jack_get_sample_rate(p->jack_ctx) / ASAP_SAMPLE_RATE, nframes, buf) != nframes) {
+			fprintf(stderr, "jack_process(): src_callback_read returned less than %d samples\n", nframes);
+		}
 
-	assert(src_callback_read(src_ctx, (double)jack_get_sample_rate(jack_ctx) / ASAP_SAMPLE_RATE, nframes, buf) == nframes);
-	for(size_t i = 0; i < nframes; ++i) {
-		buffer_left[i] = buf[i*2];
-		buffer_right[i] = buf[i*2+1];
+		for(size_t i = 0; i < nframes; ++i) {
+			buffer_left[i] = buf[i*2];
+			buffer_right[i] = buf[i*2+1];
+		}
+	} else {
+		memset(buffer_left, 0, nframes * sizeof(float));
+		memset(buffer_right, 0, nframes * sizeof(float));
 	}
 
 	return 0;
 }
 
-int main(int argc, char** argv) {
-	jack_ctx = jack_client_open("asapjack", JackNullOption, &st);
-	assert(st == 0);
-	jack_left = jack_port_register(jack_ctx, "left", JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput | JackPortIsTerminal, 0);
-	assert(jack_left > 0);
-	jack_right = jack_port_register(jack_ctx, "right", JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput | JackPortIsTerminal, 0);
-	assert(jack_right > 0);
+static void playback_path(const char* path, struct playback_context* p) {
+	void* moddata = 0;
+	int modfd = -1, moddata_length, error, millis;
 
-	modfd = open(argv[1], O_RDONLY);
-	assert(modfd != -1);
+	modfd = open(path, O_RDONLY);
+	if(modfd == -1) {
+		perror("open()");
+		goto cleanup; /* XXX? */
+	}
+
 	moddata_length = lseek(modfd, 0, SEEK_END);
-	assert(moddata_length != -1);
-	assert(lseek(modfd, 0, SEEK_SET) == 0);
+	if(moddata_length == -1 || lseek(modfd, 0, SEEK_SET) != 0) {
+		perror("lseek()");
+		goto cleanup;
+	}
+
 	moddata = mmap(0, moddata_length, PROT_READ, MAP_SHARED, modfd, 0);
-	assert(moddata != MAP_FAILED);
-	close(modfd);
+	if(moddata == MAP_FAILED) {
+		perror("mmap()");
+		goto cleanup;
+	}
 
-	asap_ctx = ASAP_New();
-	error = ASAP_Load(asap_ctx, argv[1], moddata, moddata_length);
-	assert(error == 1); /* XXX: ambiguous documentation */
-	ASAP_PlaySong(asap_ctx, 0, -1);
-	ASAP_DetectSilence(asap_ctx, 2);
-	asap_info = ASAP_GetInfo(asap_ctx);
-	src_ctx = src_callback_new(ASAPInfo_GetChannels(asap_info) == 1 ? gen_samples_mono : gen_samples_stereo, 2, 2, &error, 0);
-	assert(error == 0);
+	p->asap_ctx = ASAP_New();
+	if(ASAP_Load(p->asap_ctx, path, moddata, moddata_length) != 1) {
+		goto cleanup;
+	}
+	ASAP_PlaySong(p->asap_ctx, 0, -1);
+	ASAP_DetectSilence(p->asap_ctx, 2);
+	p->info = ASAP_GetInfo(p->asap_ctx);
+	p->src_ctx = src_callback_new(ASAPInfo_GetChannels(p->info) == 1 ? gen_samples_mono : gen_samples_stereo, 2, 2, &error, p);
+	if(error != 0) {
+		goto cleanup;
+	}
+	p->generated = 1;
+	p->ready = 1;
 
-	error = jack_set_process_callback(jack_ctx, jack_process, 0);
-	jack_activate(jack_ctx);
-	error = jack_connect(jack_ctx, "asapjack:left", "system:playback_1");
-	assert(error == 0);
-	error = jack_connect(jack_ctx, "asapjack:right", "system:playback_2");
-	assert(error == 0);
-
-	while(generated > 0) {
-		millis = ASAP_GetPosition(asap_ctx);
+	while(p->generated > 0) {
+		millis = ASAP_GetPosition(p->asap_ctx);
 		printf("\r%02d:%02d.%03d", millis / 60000, (millis / 1000) % 60, millis % 1000);
 		fflush(stdout);
 		usleep(50000);
 	}
 	putchar('\n');
 
-	jack_deactivate(jack_ctx);
+cleanup:
+	p->ready = 0;
 
-	src_delete(src_ctx);
-	ASAP_Delete(asap_ctx);
+	if(p->src_ctx) {
+		src_delete(p->src_ctx);
+		p->src_ctx = 0;
+	}
 
-	assert(munmap(moddata, moddata_length) == 0);
+	if(p->asap_ctx) {
+		ASAP_Delete(p->asap_ctx);
+		p->asap_ctx = 0;
+	}
 
-	assert(jack_port_unregister(jack_ctx, jack_left) == 0);
-	assert(jack_port_unregister(jack_ctx, jack_right) == 0);
-	assert(jack_client_close(jack_ctx) == 0);
+	if(modfd != -1) {
+		if(close(modfd) == -1) {
+			perror("close()");
+		}
+	}
+	if(moddata != 0) {
+		if(munmap(moddata, moddata_length) != 0) {
+			perror("munmap()");
+		}
+	}
+}
+
+int main(int argc, char** argv) {
+	struct playback_context p;
+	jack_status_t st;
+
+	memset(&p, 0, sizeof(struct playback_context));
+
+	p.jack_ctx = jack_client_open("asapjack", JackNullOption, &st);
+	if(st != 0) {
+		goto cleanup;
+	}
+
+	p.left = jack_port_register(p.jack_ctx, "left", JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput | JackPortIsTerminal, 0);
+	p.right = jack_port_register(p.jack_ctx, "right", JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput | JackPortIsTerminal, 0);
+	if(p.left <= 0 || p.right <= 0) {
+		goto cleanup;
+	}
+
+	if(jack_set_process_callback(p.jack_ctx, jack_process, &p) != 0 || jack_activate(p.jack_ctx) != 0) {
+		goto cleanup;
+	}
+
+	if(jack_connect(p.jack_ctx, "asapjack:left", "system:playback_1") != 0 || jack_connect(p.jack_ctx, "asapjack:right", "system:playback_2") != 0) {
+		goto cleanup;
+	}
+
+	for(size_t i = 1; i < argc; ++i) {
+		playback_path(argv[i], &p);
+	}
+
+cleanup:
+	if(p.jack_ctx != 0) {
+		/* XXX: handle failure in any of these calls */
+		jack_deactivate(p.jack_ctx);
+
+		if(p.left != 0) {
+			jack_port_unregister(p.jack_ctx, p.left);
+			p.left = 0;
+		}
+		if(p.right != 0) {
+			jack_port_unregister(p.jack_ctx, p.right);
+			p.right = 0;
+		}
+
+		jack_client_close(p.jack_ctx);
+		p.jack_ctx = 0;
+	}
 	return 0;
 }
