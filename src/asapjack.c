@@ -91,7 +91,7 @@ static int jack_process(jack_nframes_t nframes, void* payload) {
 
 static void playback_path(const char* path, struct playback_context* p) {
 	void* moddata = 0;
-	int modfd = -1, moddata_length, error, millis;
+	int modfd = -1, moddata_length, error, millis, song, duration;
 
 	modfd = open(path, O_RDONLY);
 	if(modfd == -1) {
@@ -115,15 +115,22 @@ static void playback_path(const char* path, struct playback_context* p) {
 	if(ASAP_Load(p->asap_ctx, path, moddata, moddata_length) != 1) {
 		goto cleanup;
 	}
-	ASAP_PlaySong(p->asap_ctx, 0, -1);
-	ASAP_DetectSilence(p->asap_ctx, 2);
 	p->info = ASAP_GetInfo(p->asap_ctx);
+	song = ASAPInfo_GetDefaultSong(p->info);
+	duration = ASAPInfo_GetDuration(p->info, song);
+	ASAP_PlaySong(p->asap_ctx, song, duration);
+	if(duration == -1) {
+		ASAP_DetectSilence(p->asap_ctx, 2); /* XXX */
+	}
 	p->src_ctx = src_callback_new(ASAPInfo_GetChannels(p->info) == 1 ? gen_samples_mono : gen_samples_stereo, 2, 2, &error, p);
 	if(error != 0) {
 		goto cleanup;
 	}
 	p->generated = 1;
 	p->ready = 1;
+	millis = 0;
+
+	printf("==> %s by %s\n", ASAPInfo_GetTitleOrFilename(p->info), *ASAPInfo_GetAuthor(p->info) == 0 ? "unknown" : ASAPInfo_GetAuthor(p->info));
 
 	while(p->generated > 0) {
 		millis = ASAP_GetPosition(p->asap_ctx);
