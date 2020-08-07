@@ -4,7 +4,7 @@ SRC_FLAGS=$(shell pkg-config --cflags --libs samplerate)
 default: build/asapjack
 
 build/asapjack: src/asapjack.c build Makefile
-	clang -g -O2 -Wall -Wno-unused-parameter -lm $(JACK_FLAGS) $(SRC_FLAGS) -o $@ $< /usr/lib/libasap.a
+	clang -g -O2 -Wall -Wno-unused-parameter -pthread -lm $(JACK_FLAGS) $(SRC_FLAGS) -o $@ $< /usr/lib/libasap.a
 
 build:
 	mkdir $@

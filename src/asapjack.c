@@ -7,10 +7,13 @@
  * http://sam.zoy.org/wtfpl/COPYING for more details. */
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/select.h>
 #include <sys/stat.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include <asap.h>
@@ -27,8 +30,10 @@ struct playback_context {
 	ASAP* asap_ctx;
 	ASAPInfo const* info;
 
-	int ready;
+	pthread_mutex_t asap_mutex;
 	int generated;
+	int paused;
+	int index; /* index of current module in argv */
 
 	unsigned char asap_out[BUFSZ];
 	float src_in[BUFSZ];
@@ -72,10 +77,11 @@ static int jack_process(jack_nframes_t nframes, void* payload) {
 	float* buffer_left = jack_port_get_buffer(p->left, nframes);
 	float* buffer_right = jack_port_get_buffer(p->right, nframes);
 
-	if(p->ready) {
+	if(!(p->paused) && p->asap_ctx && pthread_mutex_trylock(&(p->asap_mutex)) == 0) {
 		if(src_callback_read(p->src_ctx, (double)jack_get_sample_rate(p->jack_ctx) / ASAP_SAMPLE_RATE, nframes, buf) != nframes) {
 			fprintf(stderr, "jack_process(): src_callback_read returned less than %d samples\n", nframes);
 		}
+		pthread_mutex_unlock(&(p->asap_mutex));
 
 		for(size_t i = 0; i < nframes; ++i) {
 			buffer_left[i] = buf[i*2];
@@ -92,6 +98,9 @@ static int jack_process(jack_nframes_t nframes, void* payload) {
 static void playback_path(const char* path, struct playback_context* p) {
 	void* moddata = 0;
 	int modfd = -1, moddata_length, error, millis, song, duration;
+	fd_set s_in;
+	struct timeval ts;
+	int ret;
 
 	modfd = open(path, O_RDONLY);
 	if(modfd == -1) {
@@ -111,8 +120,10 @@ static void playback_path(const char* path, struct playback_context* p) {
 		goto cleanup;
 	}
 
+	pthread_mutex_lock(&(p->asap_mutex));
 	p->asap_ctx = ASAP_New();
 	if(ASAP_Load(p->asap_ctx, path, moddata, moddata_length) != 1) {
+		pthread_mutex_unlock(&(p->asap_mutex));
 		goto cleanup;
 	}
 	p->info = ASAP_GetInfo(p->asap_ctx);
@@ -124,25 +135,63 @@ static void playback_path(const char* path, struct playback_context* p) {
 	}
 	p->src_ctx = src_callback_new(ASAPInfo_GetChannels(p->info) == 1 ? gen_samples_mono : gen_samples_stereo, 2, 2, &error, p);
 	if(error != 0) {
+		pthread_mutex_unlock(&(p->asap_mutex));
 		goto cleanup;
 	}
 	p->generated = 1;
-	p->ready = 1;
 	millis = 0;
+	pthread_mutex_unlock(&(p->asap_mutex));
 
 	printf("==> %s by %s\n", ASAPInfo_GetTitleOrFilename(p->info), *ASAPInfo_GetAuthor(p->info) == 0 ? "unknown" : ASAPInfo_GetAuthor(p->info));
 
 	while(p->generated > 0) {
+		FD_ZERO(&s_in);
+		FD_SET(STDIN_FILENO, &s_in);
+		ts.tv_sec = 0;
+		ts.tv_usec = 0;
+		if((ret = select(1, &s_in, 0, 0, &ts)) == -1) {
+			perror("select()");
+			goto cleanup;
+		}
+
+		if(ret == 1) {
+			char c = 0;
+			if(read(STDIN_FILENO, &c, 1) < 1) {
+				perror("read()");
+			}
+
+			switch(c) {
+			case 'q':
+				p->index = -1;
+				putchar('\n');
+				goto cleanup;
+
+			case 'n':
+				putchar('\n');
+				goto cleanup;
+
+			case 'p':
+				p->index -= 2;
+				putchar('\n');
+				goto cleanup;
+
+			case ' ':
+				p->paused = !(p->paused);
+				break;
+			}
+		}
+
 		millis = ASAP_GetPosition(p->asap_ctx);
-		printf("\r%02d:%02d.%03d", millis / 60000, (millis / 1000) % 60, millis % 1000);
+		printf("\r%c[2K%02d:%02d.%03d", 27, millis / 60000, (millis / 1000) % 60, millis % 1000);
+		if(p->paused) fputs(" -- paused --", stdout);
 		fflush(stdout);
 		usleep(50000);
 	}
 	putchar('\n');
 
 cleanup:
-	p->ready = 0;
 
+	pthread_mutex_lock(&(p->asap_mutex));
 	if(p->src_ctx) {
 		src_delete(p->src_ctx);
 		p->src_ctx = 0;
@@ -152,6 +201,7 @@ cleanup:
 		ASAP_Delete(p->asap_ctx);
 		p->asap_ctx = 0;
 	}
+	pthread_mutex_unlock(&(p->asap_mutex));
 
 	if(modfd != -1) {
 		if(close(modfd) == -1) {
@@ -165,11 +215,43 @@ cleanup:
 	}
 }
 
+static void usage(const char* me) {
+	printf(
+		"Usage:\n\t%s [-h|--help]\n\t%s files...\n\n"
+		"Interactive commands:\n\tq: quit the program\n\tspace: pause/resume playback\n\tp/n: jump to previous/next file\n\n"
+		"ASAP version: %s\n%s"
+		, me, me, ASAPInfo_VERSION, ASAPInfo_CREDITS
+		);
+}
+
 int main(int argc, char** argv) {
+	if(argc == 1 || strcmp("-h", argv[1]) == 0 || strcmp("--help", argv[1]) == 0) {
+		usage(argv[0]);
+		return 0;
+	}
+
+	struct termios termios_p_orig, termios_p;
 	struct playback_context p;
 	jack_status_t st;
 
 	memset(&p, 0, sizeof(struct playback_context));
+	termios_p.c_iflag = 0;
+
+	if(tcgetattr(STDIN_FILENO, &termios_p_orig) != 0) {
+		perror("tcgetattr()");
+		goto cleanup;
+	}
+
+	termios_p = termios_p_orig;
+	termios_p.c_lflag &= ~(ICANON | ECHO);
+	if(tcsetattr(STDIN_FILENO, TCSANOW, &termios_p) != 0) {
+		perror("tcsetattr()");
+		goto cleanup;
+	}
+
+	if(pthread_mutex_init(&(p.asap_mutex), 0) != 0) {
+		goto cleanup; /* XXX */
+	}
 
 	p.jack_ctx = jack_client_open("asapjack", JackNullOption, &st);
 	if(st != 0) {
@@ -190,11 +272,17 @@ int main(int argc, char** argv) {
 		goto cleanup;
 	}
 
-	for(size_t i = 1; i < argc; ++i) {
-		playback_path(argv[i], &p);
+	p.index = 1;
+	while(p.index >= 1 && p.index < argc) {
+		playback_path(argv[p.index], &p);
+		++p.index;
 	}
 
 cleanup:
+	if(termios_p.c_iflag) {
+		tcsetattr(STDIN_FILENO, TCSANOW, &termios_p_orig); /* XXX check failure? */
+	}
+
 	if(p.jack_ctx != 0) {
 		/* XXX: handle failure in any of these calls */
 		jack_deactivate(p.jack_ctx);
@@ -211,5 +299,7 @@ cleanup:
 		jack_client_close(p.jack_ctx);
 		p.jack_ctx = 0;
 	}
+
+	pthread_mutex_destroy(&(p.asap_mutex)); /* XXX: check if initialised? */
 	return 0;
 }
